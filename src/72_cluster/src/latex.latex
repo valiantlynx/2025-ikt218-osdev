@@ -1,0 +1,1202 @@
+%% PREAMBEL %%
+\input{template/preamble.tex}
+
+%% DOKUMENT START %%
+\begin{document}
+
+\pagenumbering{roman} % Sidenummerering for forord og TOC
+
+%% FORSIDE %%
+\include{template/title}
+
+%% Declaration %%
+\include{template/declaration.tex}
+
+%% INNHOLDSFORTEGNELSE %%
+\setlength{\parskip}{.5em} % Setter linjeavstander i TOC litt mindre
+\cleardoublepage
+\tableofcontents
+\setlength{\parskip}{1em} % Går tilbake til standard avstand
+\newpage
+
+%% SAMMENDRAG & FORORD %%
+
+\pagenumbering{arabic} % Sidenummerering for resten av dokumentet
+
+%% SEKSJONER %%
+\section{Introduction to OPSYS}
+
+Operating systems are the backbone of modern computing, serving as the critical interface between hardware and applications. This section dives into the fascinating journey of the boot process—the sequence that breathes life into our computers, which we've implemented in our project's codebase.
+
+\subsection{Power-On Self-Test (POST)}
+When you hit that power button, your computer doesn't just magically boot up. It first runs through a series of diagnostic tests called the POST. This process is like the computer's morning routine—checking if all components are functioning properly before starting the day.
+
+The POST is handled by firmware stored in a special chip on the motherboard. It verifies that essential hardware like the CPU, RAM, and storage devices are working correctly. If anything's wrong, you'll get those beep codes or error messages—basically the computer's way of saying "Houston, we have a problem." 
+
+In our implementation, we don't need to worry about the POST since it's handled by the hardware (or emulated by QEMU in our case), but understanding it is crucial for grasping the full boot sequence that leads to our kernel being loaded.
+
+\subsection{Boot Sequence Post-POST}
+Once the POST gives the green light, the real action begins. The BIOS (Basic Input/Output System) or its modern replacement UEFI (Unified Extensible Firmware Interface) takes over. 
+
+In our project, we use the Limine bootloader which interfaces with either BIOS or UEFI. When we build our OS image using the CMake script, we specifically copy Limine's BIOS and UEFI components to our ISO, as seen in our CMakeLists.txt:
+
+\begin{verbatim}
+set(LIMINE_DIR /usr/local/limine)
+add_custom_target(
+    uiaos-create-image
+    COMMAND cp -v ${LIMINE_DIR}/limine-bios.sys ${LIMINE_DIR}/limine-bios-cd.bin
+        ${LIMINE_DIR}/limine-uefi-cd.bin ${ISO_DIR}/
+    # ...other commands...
+)
+\end{verbatim}
+
+This ensures our kernel can boot on both legacy BIOS systems and modern UEFI hardware.
+
+\subsection{Bootloaders}
+Our project uses Limine, a modern bootloader designed specifically for hobby OS development. In our implementation, Limine handles the complex task of transitioning from real mode to protected mode, loading our kernel into memory, and passing control to our \texttt{kernel\_main()} function.
+
+We configure Limine using the \texttt{limine.cfg} file, which specifies important parameters like the kernel filename and command-line arguments:
+
+\begin{verbatim}
+# limine.cfg snippet (implied)
+TIMEOUT=0
+VERBOSE=yes
+GRAPHICS=yes
+
+:UIA OS
+PROTOCOL=stivale2
+KERNEL_PATH=boot:///kernel.bin
+\end{verbatim}
+
+While more complex bootloaders like GRUB offer extensive multi-boot support, Limine's simplicity makes it perfect for educational OS development like ours.
+
+\subsection{Memory Layout in the Boot Process}
+In our kernel implementation, understanding memory layout is crucial. Our memory management code in \texttt{malloc.c} initializes the kernel heap based on the memory layout passed by the bootloader:
+
+\begin{verbatim}
+void init_kernel_memory(uint32_t *kernel_end)
+{
+    last_alloc = (uint32_t)kernel_end + 0x1000;
+    heap_begin = last_alloc;
+    pheap_end = 0x400000;
+    pheap_begin = pheap_end - (MAX_PAGE_ALIGNED_ALLOCS * 4096);
+    heap_end = pheap_begin;
+    // ...
+}
+\end{verbatim}
+
+This code establishes our heap at a safe location after the kernel's end address, demonstrating the practical importance of understanding memory layout in OS development. Our implementation carefully manages memory to avoid conflicts with the bootloader and reserved areas.
+
+\subsection{Boot Process in Modern Operating Systems}
+While modern OS boot processes involve complex chains of bootloaders, our implementation focuses on the essential path from bootloader to kernel execution. Our entry point is \texttt{kernel\_main()}, which is called by Limine after it sets up the necessary environment:
+
+\begin{verbatim}
+int kernel_main()
+{
+    // Allocate memory to demonstrate our memory management
+    void *some_memory = malloc(12345);
+    void *memory2 = malloc(54321);
+    void *memory3 = malloc(13331);
+    // ...
+    // Initialize our subsystems and enter the main loop
+    // ...
+}
+\end{verbatim}
+
+This simplicity allows us to focus on core OS concepts without getting lost in the complexity of modern boot systems.
+
+\subsection{Virtual Machines and Booting}
+Our development process relies heavily on QEMU for testing. Our start script (\texttt{start\_qemu.sh}) demonstrates how we leverage virtualization for development:
+
+\begin{verbatim}
+qemu-system-i386 \
+    -S -gdb tcp::1234 \
+    -boot d -hda $KERNEL_PATH -hdb $DISK_PATH \
+    -m 64 \
+    -audiodev alsa,id=snd0 \
+    -machine pcspk-audiodev=snd0 \
+    -serial stdio \
+    -no-reboot \
+    -no-shutdown &
+\end{verbatim}
+
+This virtualized environment allows us to debug our kernel safely using GDB, test our PC speaker implementation, and quickly iterate on our code without rebooting physical hardware. The hypervisor (QEMU) translates our kernel's hardware interactions into calls that the host system can understand, creating a safe sandbox for OS development.
+
+\section{Booting and Printing}
+
+In this section, I'll dive into how I implemented two fundamental components of our operating system: the Global Descriptor Table (GDT) and the text-mode terminal interface. These components are crucial for the OS to function properly and provide basic interaction capabilities.
+
+\subsection{Global Descriptor Table (GDT)}
+
+The Global Descriptor Table (GDT) is one of the first things a kernel needs to set up. It's essentially a memory structure that defines the characteristics of memory segments used during program execution. While modern operating systems primarily use paging for memory protection, the GDT is still required for the x86 architecture to function properly.
+
+In my implementation, I created the basic structure for the GDT in \texttt{gdt.h}:
+
+\begin{verbatim}
+struct gdt_entry_struct {
+    uint16_t limit_low;
+    uint16_t base_low;
+    uint8_t base_middle;
+    uint8_t access;
+    uint8_t granularity;
+    uint8_t base_high;
+} __attribute__((packed));
+typedef struct gdt_entry_struct gdt_entry_t;
+
+struct gdt_ptr_struct {
+    uint16_t limit;
+    uint32_t base;
+} __attribute__((packed));
+typedef struct gdt_ptr_struct gdt_ptr_t;
+\end{verbatim}
+
+As required, I implemented three essential descriptors in my GDT:
+
+1. The NULL descriptor (entry 0), which must be present but never used
+2. The Code segment descriptor, which defines the executable memory region
+3. The Data segment descriptor, which defines where data can be read/written
+
+These descriptors are set up in the \texttt{gdt.c} file:
+
+\begin{verbatim}
+gdt_entry_t gdt_entries[5];
+gdt_ptr_t   gdt_ptr;
+
+void init_gdt()
+{
+    gdt_ptr.limit = (sizeof(gdt_entry_t) * 5) - 1;
+    gdt_ptr.base  = (uint32_t)&gdt_entries;
+
+    gdt_set_gate(0, 0, 0, 0, 0);                // Null segment
+    gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xCF); // Code segment
+    gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF); // Data segment
+    // User mode segments were also added
+    gdt_set_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xCF); // User mode code segment
+    gdt_set_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF); // User mode data segment
+
+    gdt_flush((uint32_t)&gdt_ptr);
+}
+\end{verbatim}
+
+The trickiest part was the assembly code needed to actually load the GDT. I implemented this in \texttt{gdt.asm}:
+
+\begin{verbatim}
+global gdt_flush
+
+gdt_flush:
+    MOV eax, [esp + 4]
+    LGDT [eax]        ; Load the GDT pointer
+
+    MOV ax, 0x10      ; 0x10 is the offset in the GDT to our data segment
+    MOV ds, ax        ; Load all data segment selectors
+    MOV es, ax
+    MOV fs, ax
+    MOV gs, ax
+    MOV ss, ax
+    JMP 0x08:.flush   ; 0x08 is the offset to our code segment
+.flush:
+    RET
+\end{verbatim}
+
+This assembly code is crucial because after loading a new GDT, we need to reload all the segment registers. The far jump to \texttt{.flush} is particularly important as it forces the CPU to flush its instruction pipeline and load the new code segment.
+
+\subsection{Text Mode Terminal}
+
+Once the GDT was set up, I implemented a text mode terminal to display output. The VGA text mode is perfect for early OS development because it's simple to use—we just need to write characters and attributes directly to video memory.
+
+My implementation in \texttt{vga.c} manages the terminal state and provides functions for writing characters and strings:
+
+\begin{verbatim}
+uint16_t* video_memory = (uint16_t*)0xB8000;
+uint8_t terminal_color = 0x0F;  // White on black by default
+uint16_t cursor_x = 0;
+uint16_t cursor_y = 0;
+
+void init_vga(void) {
+    // Clear the screen
+    clear_screen();
+    // Initialize the cursor
+    move_cursor(0, 0);
+}
+
+void print(const char* message) {
+    uint16_t i = 0;
+    while (message[i] != 0) {
+        putchar(message[i++]);
+    }
+}
+\end{verbatim}
+
+To handle more complex formatting, I implemented a simple \texttt{printf} function in \texttt{stdio.c}:
+
+\begin{verbatim}
+int printf(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    int result = vprintf(format, args);
+    va_end(args);
+    return result;
+}
+
+int vprintf(const char *format, va_list args) {
+    // Handle format specifiers like %d, %x, %s, etc.
+    // ...
+}
+\end{verbatim}
+
+This allowed me to easily format output in the kernel:
+
+\begin{verbatim}
+printf("Hello, %s! Number: %d", "World", 42);
+\end{verbatim}
+
+\subsection{Putting It All Together}
+
+In my kernel's main function, I integrated these components to create a working system:
+
+\begin{verbatim}
+int kernel_main() {
+    // Initialize Global Descriptor Table
+    init_gdt();
+    
+    // Initialize VGA text mode
+    init_vga();
+    
+    // Print our first message
+    printf("Hello, World! Welcome to UiA OS\n");
+    
+    // ...rest of kernel initialization...
+}
+\end{verbatim}
+
+The GDT implementation was challenging because it required understanding low-level CPU structures and assembly language. The most difficult part was ensuring the segment descriptors were set correctly—each bit in the access and granularity bytes has a specific meaning that affects how the CPU interprets memory accesses.
+
+For the text mode terminal, the main challenge was implementing proper scrolling and handling special characters like newlines and tabs. I also had to carefully manage the cursor position to ensure text displayed correctly on the screen.
+
+By implementing both the GDT and text output, I've established the fundamental building blocks needed for further OS development. The GDT sets up memory segmentation which is necessary for the CPU to function properly, while the text output provides a way to debug and observe the kernel's operation.
+
+\section{Interrupts}
+
+Interrupts are a cornerstone of modern operating system design, allowing the CPU to temporarily suspend its current execution path to handle high-priority events. In this section, I'll explain how I implemented interrupt handling in our kernel, covering the Interrupt Descriptor Table (IDT), Interrupt Service Routines (ISRs), Interrupt Requests (IRQs), and keyboard input handling.
+
+\subsection{Interrupt Descriptor Table (IDT)}
+
+The IDT is a data structure that tells the CPU where to find the handlers for different types of interrupts. Similar to the GDT, it's a table that must be loaded into a special CPU register using assembly code.
+
+In my implementation, I defined the structure of the IDT entries in \texttt{idt.h}:
+
+\begin{verbatim}
+struct idt_entry_struct {
+    uint16_t base_low;
+    uint16_t sel;
+    uint8_t always0;
+    uint8_t flags;
+    uint16_t base_high;
+} __attribute__((packed));
+typedef struct idt_entry_struct idt_entry_t;
+
+struct idt_ptr_struct {
+    uint16_t limit;
+    uint32_t base;
+} __attribute__((packed));
+typedef struct idt_ptr_struct idt_ptr_t;
+\end{verbatim}
+
+Each IDT entry points to a specific interrupt handler function. The IDT itself and its pointer are defined in \texttt{idt.c}:
+
+\begin{verbatim}
+struct idt_entry_struct idt_entries[256];
+struct idt_ptr_struct idt_ptr;
+\end{verbatim}
+
+I chose to implement all 256 possible interrupt handlers, which include:
+1. 0-31: CPU exceptions (like divide by zero, page faults)
+2. 32-47: Hardware IRQs 
+3. 48-255: Software interrupts and other uses
+
+In \texttt{idt.c}, I initialized the IDT with these entries:
+
+\begin{verbatim}
+void initIdt() {
+    idt_ptr.limit = sizeof(struct idt_entry_struct) * 256 - 1;
+    idt_ptr.base = (uint32_t) &idt_entries;
+
+    memset(&idt_entries, 0, sizeof(struct idt_entry_struct) * 256);
+
+    // Remap the PIC to avoid conflicts with CPU exceptions
+    outPortB(0x20, 0x11);
+    outPortB(0xA0, 0x11);
+    outPortB(0x21, 0x20);
+    outPortB(0xA1, 0x28);
+    outPortB(0x21, 0x04);
+    outPortB(0xA1, 0x02);
+    outPortB(0x21, 0x01);
+    outPortB(0xA1, 0x01);
+    outPortB(0x21, 0x0);
+    outPortB(0xA1, 0x0);
+
+    // Set up CPU exception handlers (ISRs 0-31)
+    setIdtGate(0, (uint32_t)isr0, 0x08, 0x8E);
+    setIdtGate(1, (uint32_t)isr1, 0x08, 0x8E);
+    // ...and so on for all 32 CPU exceptions...
+
+    // Set up IRQ handlers (mapped to IDT entries 32-47)
+    setIdtGate(32, (uint32_t)irq0, 0x08, 0x8E);
+    setIdtGate(33, (uint32_t)irq1, 0x08, 0x8E);
+    // ...and so on for all 16 IRQs...
+
+    // Load the IDT
+    idt_flush((uint32_t)&idt_ptr);
+}
+\end{verbatim}
+
+A crucial part of setting up the IDT was remapping the Programmable Interrupt Controller (PIC). In PC architecture, the default IRQ mapping would conflict with CPU exceptions, so I remapped IRQs 0-15 to use interrupts 32-47 instead.
+
+The actual loading of the IDT requires assembly code, which I implemented in \texttt{idt.asm}:
+
+\begin{verbatim}
+global idt_flush
+idt_flush:
+    MOV eax, [esp + 4]
+    LIDT [eax]  
+    STI           ; Enable interrupts
+    RET
+\end{verbatim}
+
+\subsection{Interrupt Service Routines (ISRs)}
+
+For CPU exceptions (interrupts 0-31), I implemented specific handlers. Each exception has its own characteristics—some push an error code onto the stack, while others don't. To handle this, I created macros in assembly to create consistent handler stubs:
+
+\begin{verbatim}
+%macro ISR_NOERRCODE 1
+    global isr%1
+    isr%1:
+        CLI 
+        PUSH LONG 0       ; Push dummy error code
+        PUSH LONG %1      ; Push interrupt number
+        JMP isr_common_stub
+%endmacro
+
+%macro ISR_ERRCODE 1
+    global isr%1
+    isr%1:
+        CLI
+        PUSH LONG %1      ; Push interrupt number (error code already pushed by CPU)
+        JMP isr_common_stub
+%endmacro
+
+; Define handlers for interrupts 0-31
+ISR_NOERRCODE 0
+ISR_NOERRCODE 1
+ISR_NOERRCODE 2
+; ...and so on...
+ISR_ERRCODE 8   ; Double fault (pushes error code)
+; ...more handlers...
+\end{verbatim}
+
+All these ISR stubs jump to a common handler, which saves the CPU state and calls the C function \texttt{isr\_handler}:
+
+\begin{verbatim}
+isr_common_stub:
+    pusha                 ; Push all registers
+    mov eax, ds           ; Save data segment
+    PUSH eax
+    MOV eax, cr2          ; Save CR2 (contains page fault address)
+    PUSH eax
+
+    MOV ax, 0x10          ; Load kernel data segment
+    MOV ds, ax
+    MOV es, ax
+    MOV fs, ax
+    MOV gs, ax
+
+    PUSH esp              ; Push pointer to registers as argument
+    CALL isr_handler      ; Call C handler
+    ; ...restore registers and return...
+\end{verbatim}
+
+In C, I implemented the actual exception handlers. Each one prints a specific message:
+
+\begin{verbatim}
+char* exception_messages[] = {
+    "Division By Zero",
+    "Debug",
+    "Non Maskable Interrupt",
+    // ...more messages...
+};
+
+void isr_handler(struct InterruptRegisters* regs) {
+    if (regs->int_no < 32) {
+        print(exception_messages[regs->int_no]);
+        print("\n");
+        print("Exception! System Halted\n");
+        for (;;);  // Halt the system
+    }
+}
+\end{verbatim}
+
+I could trigger these interrupts manually using assembly instructions like:
+
+\begin{verbatim}
+asm("int $0");  // Trigger divide-by-zero exception
+\end{verbatim}
+
+\subsection{Interrupt Requests (IRQs)}
+
+IRQs are hardware interrupts coming from external devices. I set up handlers for IRQs 0-15 using a similar approach to the ISRs:
+
+\begin{verbatim}
+%macro IRQ 2
+    global irq%1 
+    irq%1:
+        CLI
+        PUSH LONG 0
+        PUSH LONG %2      ; Push IRQ number + 32 (IDT index)
+        JMP irq_common_stub
+%endmacro
+
+IRQ 0, 32   ; Timer
+IRQ 1, 33   ; Keyboard
+; ...and so on for all 16 IRQs...
+\end{verbatim}
+
+The IRQ handler in C acknowledges the interrupt to the PIC and dispatches it to the appropriate device-specific handler:
+
+\begin{verbatim}
+void irq_handler(struct InterruptRegisters *regs)
+{
+    // Acknowledge the interrupt to the PICs
+    if (regs->int_no >= 40) {
+        outPortB(0xA0, 0x20); // Reset signal to the slave PIC
+    }
+    outPortB(0x20, 0x20); // Reset signal to the master PIC
+
+    // Handle specific interrupts
+    switch (regs->int_no) {
+    case 32: // Timer (IRQ0)
+        pit_handler();
+        break;
+    case 33: // Keyboard (IRQ1)
+        if (irq_routines[regs->int_no - 32]) {
+            ((void (*)(struct InterruptRegisters *))irq_routines[regs->int_no - 32])(regs);
+        }
+        break;
+    default:
+        // Default handler for other IRQs
+        if (irq_routines[regs->int_no - 32]) {
+            ((void (*)(struct InterruptRegisters *))irq_routines[regs->int_no - 32])(regs);
+        } else {
+            printf("Unhandled interrupt: %d\n", regs->int_no);
+        }
+        break;
+    }
+}
+\end{verbatim}
+
+\subsection{Keyboard Implementation}
+
+One of the most practical applications of interrupts is handling keyboard input. I implemented a keyboard driver that processes IRQ1:
+
+\begin{verbatim}
+// Keyboard scancode to ASCII lookup table
+unsigned char kbdus[128] = {
+    0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
+    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
+    0,  'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0,
+    '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*',
+    0, ' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '-',
+    0, 0, 0, '+', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
+
+void keyboard_handler(struct InterruptRegisters *r) {
+    unsigned char scancode;
+    
+    // Read the scancode from the keyboard I/O port
+    scancode = inb(0x60);
+    
+    // If the top bit of the scancode is set, a key was released
+    if (scancode & 0x80) {
+        // Key release handling (if needed)
+    } else {
+        // Key press - convert scancode to ASCII and print
+        char c = kbdus[scancode];
+        if (c != 0) {
+            char str[2] = {c, '\0'};
+            printf("%s", str);
+        }
+    }
+}
+
+void init_keyboard() {
+    // Register keyboard handler for IRQ1
+    irq_install_handler(1, keyboard_handler);
+    printf("Keyboard initialized.\n");
+}
+\end{verbatim}
+
+The keyboard handler reads a scancode from I/O port 0x60 whenever IRQ1 is triggered. It then translates this scancode to an ASCII character using the lookup table and displays it on screen. This allows for basic text input in the OS.
+
+\subsection{Challenges and Lessons}
+
+Implementing interrupts was one of the most challenging aspects of the OS development process. Some specific challenges I encountered were:
+
+1. **PIC Remapping**: Getting the PIC remapping correct took several attempts, as incorrect mapping can cause the interrupts to either not fire or conflict with CPU exceptions.
+
+2. **Context Saving**: Ensuring that all registers were properly saved and restored during interrupt handling was crucial. A single missed register could lead to unpredictable behavior when returning from an interrupt.
+
+3. **Nested Interrupts**: Deciding when to enable/disable interrupts was tricky. Enabling interrupts too early could lead to nested interrupts that could overflow the stack, while keeping them disabled too long could cause missed events.
+
+Through this implementation, I gained a deep understanding of how modern operating systems handle concurrent events and how the CPU's interrupt mechanism enables multitasking. The interrupt system forms the foundation for many other OS features, such as timers, keyboard input, and eventually process scheduling.
+
+\section{Memory and PIT}
+
+Memory management and timing are two critical components of any operating system. In this section, I'll detail my implementation of dynamic memory allocation and the Programmable Interval Timer (PIT) for our OS.
+
+\subsection{Memory Management}
+
+Memory management is fundamental to an operating system's functionality. Without it, the OS couldn't allocate memory for processes, manage resources efficiently, or protect memory spaces from unauthorized access. I implemented a simple but effective memory management system for our kernel.
+
+\subsubsection{Memory Layout}
+
+I started by establishing a clear memory layout for our kernel. The layout begins with the kernel code and data sections, followed by the heap area where dynamic memory allocations take place. My implementation in \texttt{malloc.c} defines this layout:
+
+\begin{verbatim}
+uint32_t last_alloc = 0;
+uint32_t heap_end = 0;
+uint32_t heap_begin = 0;
+uint32_t pheap_begin = 0;
+uint32_t pheap_end = 0;
+uint8_t *pheap_desc = 0;
+uint32_t memory_used = 0;
+
+void init_kernel_memory(uint32_t *kernel_end)
+{
+    last_alloc = (uint32_t)kernel_end + 0x1000;
+    heap_begin = last_alloc;
+    pheap_end = 0x400000;
+    pheap_begin = pheap_end - (MAX_PAGE_ALIGNED_ALLOCS * 4096);
+    heap_end = pheap_begin;
+    memset((char *)heap_begin, 0, heap_end - heap_begin);
+    
+    pheap_desc = (uint8_t *)malloc(MAX_PAGE_ALIGNED_ALLOCS);
+    if (pheap_desc) {
+        memset(pheap_desc, 0, MAX_PAGE_ALIGNED_ALLOCS);
+    } else {
+        panic("Could not allocate memory for page-aligned heap descriptor");
+    }
+    
+    printf("Kernel heap starts at 0x%x\n", last_alloc);
+}
+\end{verbatim}
+
+The function \texttt{init\_kernel\_memory} takes a pointer to the end of the kernel binary (provided by the linker) and sets up the heap to start 4KB beyond that point. This ensures we don't accidentally overwrite any kernel data. I also set aside space for page-aligned allocations at the end of the heap area, which is useful for certain hardware operations that require page-aligned memory.
+
+To help with debugging, I implemented a function to print out the current memory layout:
+
+\begin{verbatim}
+void print_memory_layout()
+{
+    printf("Memory used: %d bytes\n", memory_used);
+    printf("Memory free: %d bytes\n", heap_end - heap_begin - memory_used);
+    printf("Heap size: %d bytes\n", heap_end - heap_begin);
+    printf("Heap start: 0x%x\n", heap_begin);
+    printf("Heap end: 0x%x\n", heap_end);
+    printf("PHeap start: 0x%x\nPHeap end: 0x%x\n", pheap_begin, pheap_end);
+}
+\end{verbatim}
+
+This function provides a clear view of our memory usage, showing how much memory is allocated, how much is free, and where different sections of memory start and end.
+
+\subsubsection{malloc and free Implementation}
+
+The core of my memory management system is the \texttt{malloc} function, which allocates memory dynamically:
+
+\begin{verbatim}
+void *malloc(size_t size)
+{
+    if (!size)
+        return 0;
+
+    // Loop through blocks to find an available block with enough size
+    uint8_t *mem = (uint8_t *)heap_begin;
+    while ((uint32_t)mem < last_alloc)
+    {
+        alloc_t *a = (alloc_t *)mem;
+        printf("mem=0x%x a={.status=%d, .size=%d}\n", mem, a->status, a->size);
+
+        if (!a->size)
+            goto nalloc;
+        if (a->status)
+        {
+            mem += a->size;
+            mem += sizeof(alloc_t);
+            mem += 4;
+            continue;
+        }
+        // If the block is not allocated and its size is big enough, adjust its size, 
+        // set the status, and return the location.
+        if (a->size >= size)
+        {
+            a->status = 1;
+            printf("RE:Allocated %d bytes from 0x%x to 0x%x\n", size, 
+                   mem + sizeof(alloc_t), mem + sizeof(alloc_t) + size);
+            memset(mem + sizeof(alloc_t), 0, size);
+            memory_used += size + sizeof(alloc_t);
+            return (char *)(mem + sizeof(alloc_t));
+        }
+        // If the block is not allocated and its size is not big enough, 
+        // add its size and the sizeof(alloc_t) to the pointer and continue.
+        mem += a->size;
+        mem += sizeof(alloc_t);
+        mem += 4;
+    }
+
+nalloc:;
+    if (last_alloc + size + sizeof(alloc_t) >= heap_end)
+    {
+        panic("Cannot allocate bytes! Out of memory.\n");
+    }
+    alloc_t *alloc = (alloc_t *)last_alloc;
+    alloc->status = 1;
+    alloc->size = size;
+
+    last_alloc += size;
+    last_alloc += sizeof(alloc_t);
+    last_alloc += 4;
+    printf("Allocated %d bytes from 0x%x to 0x%x\n", size, 
+           (uint32_t)alloc + sizeof(alloc_t), last_alloc);
+    memory_used += size + 4 + sizeof(alloc_t);
+    memset((char *)((uint32_t)alloc + sizeof(alloc_t)), 0, size);
+    return (char *)((uint32_t)alloc + sizeof(alloc_t));
+}
+\end{verbatim}
+
+My implementation uses a simple first-fit algorithm with allocation headers. Each allocated block has a header (\texttt{alloc\_t}) that stores the block's size and status (allocated or free). When \texttt{malloc} is called, it first tries to find an existing free block that's large enough. If none is found, it allocates memory from the end of the heap.
+
+The counterpart to \texttt{malloc} is \texttt{free}, which deallocates memory:
+
+\begin{verbatim}
+void free(void *mem)
+{
+    alloc_t *alloc = (mem - sizeof(alloc_t));
+    memory_used -= alloc->size + sizeof(alloc_t);
+    alloc->status = 0;
+}
+\end{verbatim}
+
+This function marks a block as free by setting its status to 0, allowing it to be reused by future \texttt{malloc} calls.
+
+\subsubsection{Page-Aligned Memory Allocation}
+
+For hardware operations that require page-aligned memory, I implemented special allocation functions:
+
+\begin{verbatim}
+char *pmalloc(size_t size)
+{
+    // Loop through the available list
+    for (int i = 0; i < MAX_PAGE_ALIGNED_ALLOCS; i++)
+    {
+        if (pheap_desc[i])
+            continue;
+        pheap_desc[i] = 1;
+        printf("PAllocated from 0x%x to 0x%x\n", pheap_begin + i * 4096, 
+               pheap_begin + (i + 1) * 4096);
+        return (char *)(pheap_begin + i * 4096);
+    }
+    printf("pmalloc: FATAL: failure!\n");
+    return 0;
+}
+
+void pfree(void *mem)
+{
+    uint32_t mem_addr = (uint32_t)mem;
+    if (mem_addr < pheap_begin || mem_addr > pheap_end)
+        return;
+
+    // page ID
+    uint32_t ad = (uint32_t)mem;
+    ad -= pheap_begin;
+    ad /= 4096;
+
+    // page descriptor to free
+    pheap_desc[ad] = 0;
+}
+\end{verbatim}
+
+These functions allocate and free whole pages (4KB blocks) of memory that are aligned to page boundaries, which is often required for device drivers and kernel data structures.
+
+\subsubsection{C++ Support}
+
+To support C++ in our kernel, I overloaded the \texttt{new} and \texttt{delete} operators to use our \texttt{malloc} and \texttt{free} functions:
+
+\begin{verbatim}
+void* operator new(unsigned int size) noexcept
+{
+    return malloc(size);
+}
+
+void* operator new[](unsigned int size) noexcept
+{
+    return malloc(size);
+}
+
+void operator delete(void *ptr) noexcept
+{
+    free(ptr);
+}
+
+void operator delete[](void *ptr) noexcept
+{
+    free(ptr);
+}
+
+void operator delete(void *ptr, unsigned int size) noexcept
+{
+    (void)size; // unused parameter
+    free(ptr);
+}
+
+void operator delete[](void *ptr, unsigned int size) noexcept
+{
+    (void)size; // unused parameter
+    free(ptr);
+}
+\end{verbatim}
+
+This allows us to use C++ constructs like \texttt{new} and \texttt{delete} in our kernel code, which is especially useful for object-oriented components like the music player.
+
+\subsection{Programmable Interval Timer (PIT)}
+
+The Programmable Interval Timer (PIT) is a chip that generates periodic interrupts, which are essential for many OS functions such as process scheduling and keeping track of time. I implemented a PIT driver to provide timing capabilities for our kernel.
+
+\subsubsection{PIT Initialization}
+
+The first step was to define the relevant constants and initialize the PIT chip:
+
+\begin{verbatim}
+#define PIT_CMD_PORT 0x43
+#define PIT_CHANNEL0_PORT 0x40
+#define PIT_CHANNEL1_PORT 0x41
+#define PIT_CHANNEL2_PORT 0x42
+#define PC_SPEAKER_PORT 0x61
+#define PIT_DEFAULT_DIVISOR 0x4E20 // 20000, which gives about 18.2 Hz
+
+#define PIC1_CMD_PORT 0x20
+#define PIC1_DATA_PORT 0x20
+#define PIC_EOI 0x20 /* End-of-interrupt command code */
+
+#define PIT_BASE_FREQUENCY 1193180
+#define TARGET_FREQUENCY 1000 // 1000 Hz
+#define DIVIDER (PIT_BASE_FREQUENCY / TARGET_FREQUENCY)
+#define TICKS_PER_MS (TARGET_FREQUENCY / TARGET_FREQUENCY)
+
+volatile uint32_t tick = 0; // Volatile to ensure changes are seen across all CPU cores
+
+void pit_handler()
+{
+    tick++;
+    onIrq0(); // Timer interrupt handler function
+    outb(PIC1_CMD_PORT, PIC_EOI); // Acknowledge the interrupt at the PIC
+}
+
+void init_pit()
+{
+    outb(PIT_CMD_PORT, 0x36);                       // Command byte for square wave mode
+    outb(PIT_CHANNEL0_PORT, DIVIDER & 0xFF);        // Low byte
+    outb(PIT_CHANNEL0_PORT, (DIVIDER >> 8) & 0xFF); // High byte
+    register_interrupt_handler(IRQ0, &pit_handler); // IRQ0 is typically used for PIT
+}
+\end{verbatim}
+
+I configured the PIT to generate interrupts at a frequency of 1000Hz (every 1ms), making it convenient for timing operations. The \texttt{pit\_handler} function increments a global counter (\texttt{tick}) on each interrupt and acknowledges the interrupt so the PIC can send more.
+
+\subsubsection{Sleep Functions}
+
+With the PIT initialized, I implemented two types of sleep functions:
+
+\begin{verbatim}
+void sleep_busy(uint32_t milliseconds)
+{
+    uint32_t start_tick = tick;
+    uint32_t ticks_to_wait = milliseconds; // Tick increments / ms
+    while (tick - start_tick < ticks_to_wait)
+    {
+        // Busy wait - do nothing but check the tick count
+    }
+}
+
+void sleep_interrupt(uint32_t milliseconds)
+{
+    uint32_t end_tick = tick + milliseconds;
+    while (tick < end_tick)
+    {
+        asm volatile("sti\n\t" // Enable interrupts
+                     "hlt\n\t" // Halt CPU til next interrupt
+                     ::: "memory");
+    }
+}
+\end{verbatim}
+
+The \texttt{sleep\_busy} function uses a busy-waiting approach, continuously checking the tick counter until the desired time has passed. This is simple but inefficient, as it consumes 100\% CPU during the wait.
+
+In contrast, \texttt{sleep\_interrupt} uses the CPU's \texttt{hlt} instruction to put the CPU to sleep until the next interrupt occurs. This is much more efficient, as it allows the CPU to enter a low-power state while waiting.
+
+\subsubsection{Demonstrating the PIT}
+
+To demonstrate the functionality of our PIT implementation, I added a test loop in the kernel's main function:
+
+\begin{verbatim}
+int counter = 0;
+while (true)
+{
+    printf("[%d]: Sleeping with busy-waiting (HIGH CPU).\n", counter);
+    sleep_busy(1000);
+    printf("[%d]: Slept using busy-waiting.\n", counter++);
+
+    printf("[%d]: Sleeping with interrupts (LOW CPU).\n", counter);
+    sleep_interrupt(1000);
+    printf("[%d]: Slept using interrupts.\n", counter++);
+}
+\end{verbatim}
+
+This loop alternates between the two sleep methods, each waiting for 1 second, and provides visual output to demonstrate their operation. The difference between these methods would be apparent in a hardware performance monitor, where \texttt{sleep\_busy} would show high CPU usage and \texttt{sleep\_interrupt} would show low usage.
+
+\subsection{Challenges and Insights}
+
+Implementing memory management and timing for our OS presented several challenges:
+
+\subsubsection{Memory Management Challenges}
+
+1. **Avoiding Memory Leaks**: Without proper memory tracking, it's easy to lose track of allocated memory. My implementation includes tracking of used memory, but a more advanced system would include garbage collection or reference counting.
+
+2. **Fragmentation**: Over time, frequent allocations and deallocations can lead to memory fragmentation. My simple first-fit algorithm doesn't handle this well, and a more sophisticated system might include compaction or different allocation strategies.
+
+3. **Error Handling**: Robust error handling is crucial for memory management. My implementation includes basic checks for out-of-memory conditions, but a production system would need more comprehensive error handling.
+
+\subsubsection{PIT Challenges}
+
+1. **Timing Precision**: The PIT has inherent limitations in timing precision. While I set it to 1000Hz for convenience, some applications might need higher precision timers.
+
+2. **Interrupt Overhead**: Each PIT interrupt has some processing overhead. At high frequencies, this overhead can become significant.
+
+3. **Race Conditions**: When dealing with interrupts and timing, race conditions are a constant concern. The \texttt{volatile} keyword for our tick counter is essential to prevent optimization issues.
+
+\subsection{Conclusion}
+
+Memory management and timing are foundational components of any operating system. My implementations provide the basic functionality needed for our kernel to allocate memory dynamically and perform timed operations. While there's plenty of room for enhancement—such as implementing virtual memory, more sophisticated allocation algorithms, or higher-precision timers—these implementations provide a solid foundation for our educational OS.
+
+In a real-world OS, memory management would likely include features like virtual memory with paging, memory protection, and sophisticated garbage collection. Similarly, timing would involve multiple timer sources with different precisions. However, for our purposes, these implementations demonstrate the core principles and provide the functionality needed for the rest of our kernel.
+
+\section{Music Player}
+
+Creating a music player for the OS was an exciting challenge that brought together many of the components we've developed so far, especially the PIT and interrupt handling system. In this section, I'll explain how I implemented a system to play simple tunes using the PC speaker.
+
+\subsection{The PC Speaker}
+
+The PC speaker is one of the oldest and most basic audio devices in computer hardware. Despite its limitations, it's perfect for an educational OS project because it requires minimal setup—no complex drivers or external hardware needed. The speaker is controlled through two primary mechanisms:
+
+1. The Programmable Interval Timer (PIT) Channel 2, which generates the square wave at the desired frequency
+2. The PC speaker control port (0x61), which enables or disables sound output
+
+\subsection{Design Overview}
+
+I designed the music system with a simple object-oriented approach using C++ features. The main components are:
+
+\begin{verbatim}
+// Note structure represents a single musical note
+typedef struct {
+    uint16_t frequency;  // Frequency in Hz (e.g., 440 for A4)
+    uint16_t duration;   // Duration in milliseconds
+} Note;
+
+// Song structure holds an array of notes
+typedef struct {
+    Note* notes;
+    size_t note_count;
+} Song;
+
+// SongPlayer is responsible for playing songs
+typedef struct {
+    void (*play_song)(Song* song);
+} SongPlayer;
+\end{verbatim}
+
+This design separates the data (songs and notes) from the functionality (playing), allowing for a clean implementation.
+
+\subsection{Speaker Control}
+
+The first step was implementing basic control over the PC speaker. This involved two key functions:
+
+\begin{verbatim}
+#define PC_SPEAKER_PORT 0x61
+#define PIT_COMMAND_PORT 0x43
+#define PIT_CHANNEL2_PORT 0x42
+#define PIT_DIVISOR 1193180
+
+void enable_speaker() {
+    uint8_t tmp = inb(PC_SPEAKER_PORT);
+    if ((tmp & 3) == 0) {
+        outb(PC_SPEAKER_PORT, tmp | 3);
+    }
+}
+
+void disable_speaker() {
+    uint8_t tmp = inb(PC_SPEAKER_PORT);
+    outb(PC_SPEAKER_PORT, tmp & 0xFC);
+}
+\end{verbatim}
+
+These functions toggle the PC speaker by manipulating bits 0 and 1 of port 0x61:
+- Bit 0 controls the gate to the speaker
+- Bit 1 controls whether timer data is sent to the speaker
+
+Setting both bits turns the speaker on with the PIT's frequency, while clearing them turns it off.
+
+\subsection{Sound Generation}
+
+To generate actual tones, I needed to program the PIT's channel 2 to produce the correct frequencies:
+
+\begin{verbatim}
+void play_note(uint16_t frequency, uint16_t duration_ms) {
+    if (frequency == 0) {
+        // Silence - just wait for the duration
+        sleep_interrupt(duration_ms);
+        return;
+    }
+
+    // Calculate divisor for the given frequency
+    uint16_t divisor = PIT_DIVISOR / frequency;
+    
+    // Configure PIT channel 2 for the frequency
+    outb(PIT_COMMAND_PORT, 0xB6);  // 10110110b - channel 2, mode 3, binary
+    outb(PIT_CHANNEL2_PORT, divisor & 0xFF);        // Low byte
+    outb(PIT_CHANNEL2_PORT, (divisor >> 8) & 0xFF); // High byte
+    
+    // Turn on the PC speaker
+    enable_speaker();
+    
+    // Wait for the duration of the note
+    sleep_interrupt(duration_ms);
+    
+    // Turn off the PC speaker after the note
+    disable_speaker();
+}
+\end{verbatim}
+
+The function works by:
+1. Converting the desired frequency to a divisor value
+2. Programming PIT channel 2 to generate a square wave at that frequency
+3. Enabling the speaker
+4. Using our previously implemented \texttt{sleep\_interrupt} function to wait for the note's duration
+5. Disabling the speaker when done
+
+This approach ensures accurate timing between notes thanks to our PIT implementation from the previous section.
+
+\subsection{Song Player Implementation}
+
+With the ability to play individual notes, I implemented the core song player functionality:
+
+\begin{verbatim}
+void play_song_impl(Song* song) {
+    printf("Playing song with %d notes\n", song->note_count);
+    for (int i = 0; i < song->note_count; i++) {
+        Note note = song->notes[i];
+        if (note.frequency > 0) {
+            printf("Playing note: freq=%d, duration=%d\n", note.frequency, note.duration);
+            play_note(note.frequency, note.duration);
+        } else {
+            // This is a rest, just wait
+            sleep_interrupt(note.duration);
+        }
+        
+        // Small gap between notes for clarity
+        sleep_interrupt(10);
+    }
+}
+
+SongPlayer* create_song_player() {
+    SongPlayer* player = (SongPlayer*)malloc(sizeof(SongPlayer));
+    player->play_song = play_song_impl;
+    return player;
+}
+\end{verbatim}
+
+The player iterates through each note in the song, playing each one with its specified frequency and duration. I added a small gap between notes to prevent them from blending together, which improves clarity.
+
+\subsection{Predefined Songs}
+
+To make the system more interesting, I created several predefined songs. Here's an example of how one song is defined:
+
+\begin{verbatim}
+// Notes for "Twinkle Twinkle Little Star"
+Note music_1[] = {
+    {262, 400}, // C4
+    {262, 400}, // C4
+    {392, 400}, // G4
+    {392, 400}, // G4
+    {440, 400}, // A4
+    {440, 400}, // A4
+    {392, 800}, // G4 (longer)
+    
+    {349, 400}, // F4
+    {349, 400}, // F4
+    {330, 400}, // E4
+    {330, 400}, // E4
+    {294, 400}, // D4
+    {294, 400}, // D4
+    {262, 800}, // C4 (longer)
+    
+    // ... remaining notes ...
+};
+\end{verbatim}
+
+Each note is defined by its frequency in Hz and duration in milliseconds. A frequency of 0 represents a rest (silence). I implemented several well-known tunes to demonstrate the system's capabilities.
+
+\subsection{Integration with the Kernel}
+
+To integrate the music player with the rest of the kernel, I added the necessary setup in \texttt{kernel\_main()}:
+
+\begin{verbatim}
+Song *songs[] = {
+    new Song({music_1, sizeof(music_1) / sizeof(Note)}),
+    new Song({music_2, sizeof(music_2) / sizeof(Note)}),
+    new Song({music_3, sizeof(music_3) / sizeof(Note)}),
+    new Song({music_4, sizeof(music_4) / sizeof(Note)}),
+    new Song({music_5, sizeof(music_5) / sizeof(Note)}),
+    new Song({music_6, sizeof(music_6) / sizeof(Note)}),
+    new Song({music_7, sizeof(music_7) / sizeof(Note)})
+};
+
+uint32_t n_songs = sizeof(songs) / sizeof(Song *);
+SongPlayer *player = create_song_player();
+
+for (int count = 0; count < 1; count++) { 
+    for (uint32_t i = 0; i < n_songs; i++) {
+        printf("Playing Song...\n");
+        player->play_song(songs[i]);
+        printf("Finished playing the song.\n");
+    }
+}
+\end{verbatim}
+
+This code plays through all the predefined songs once. The outer loop could be modified to play the songs multiple times if desired.
+
+\subsection{Challenges and Solutions}
+
+Implementing the music player presented several interesting challenges:
+
+\subsubsection{Timing Accuracy}
+
+The most significant challenge was achieving accurate timing between notes. If the PIT wasn't properly configured or the sleep functions weren't working correctly, the music would sound too fast, too slow, or erratic. My solution was to rely on the PIT-based sleep functions I had already implemented:
+
+\begin{verbatim}
+void sleep_interrupt(uint32_t milliseconds)
+{
+    uint32_t end_tick = tick + milliseconds;
+    while (tick < end_tick)
+    {
+        asm volatile("sti\n\t" // Enable interrupts
+                     "hlt\n\t" // Halt CPU til next interrupt
+                     ::: "memory");
+    }
+}
+\end{verbatim}
+
+This function provides reasonably accurate timing by counting PIT ticks, which occur at a known frequency.
+
+\subsubsection{Speaker Control}
+
+Another challenge was understanding the PC speaker control mechanism. The PC speaker is controlled through two different I/O ports:
+- Port 0x43 for PIT commands (to set the frequency)
+- Port 0x61 for speaker control (to enable/disable sound)
+
+Getting this right required careful reading of the hardware documentation and some experimentation.
+
+\subsubsection{Frequency Calculation}
+
+Converting musical notes to the correct frequencies required some math. The PIT operates at approximately 1.19 MHz, and we need to divide this by the desired frequency to get the correct divisor value:
+
+\begin{verbatim}
+uint16_t divisor = PIT_DIVISOR / frequency;
+\end{verbatim}
+
+This creates a square wave at the specified frequency, which the PC speaker converts to sound. However, the PC speaker has limited range and fidelity, so some notes might sound slightly off compared to their true musical pitches.
+
+\subsubsection{Memory Management}
+
+Since I chose an object-oriented approach with dynamic memory allocation, I had to ensure proper memory management. The SongPlayer is allocated with malloc:
+
+\begin{verbatim}
+SongPlayer* create_song_player() {
+    SongPlayer* player = (SongPlayer*)malloc(sizeof(SongPlayer));
+    player->play_song = play_song_impl;
+    return player;
+}
+\end{verbatim}
+
+In a more complete implementation, there should be a corresponding \texttt{destroy\_song\_player} function to free this memory. However, since our kernel doesn't have a concept of termination yet, this wasn't strictly necessary.
+
+\subsection{Testing and Results}
+
+To test the music player, I added a section in the kernel main function that plays through all the predefined songs:
+
+\begin{verbatim}
+for (uint32_t i = 0; i < n_songs; i++) {
+    printf("Playing Song %d...\n", i+1);
+    player->play_song(songs[i]);
+    printf("Finished playing song %d.\n", i+1);
+    
+    // Short delay between songs
+    sleep_interrupt(500);
+}
+\end{verbatim}
+
+The results were satisfying—the PC speaker successfully played recognizable tunes with correct timing. While the audio quality was limited by the hardware (PC speakers can only produce square waves), the system effectively demonstrated the integration of several OS components:
+- PIT for timing
+- I/O port access for hardware control
+- Interrupt handling for efficient waiting between notes
+- Memory management for storing song data
+
+\subsection{Future Improvements}
+
+While the current implementation serves its purpose, there are several ways it could be improved:
+- Add volume control using pulse-width modulation
+- Support for more complex musical notation like rests and tempo changes
+- Implementing a more sophisticated audio subsystem that could support multiple sound channels
+- Creating a real-time sequencer for dynamic music generation
+
+\subsection{Conclusion}
+
+Implementing the music player was an excellent exercise that brought together many aspects of OS development. It demonstrated how higher-level features can be built on top of the fundamental OS components we've been developing throughout this project. The ability to play music also adds a fun, interactive element to our otherwise text-based OS, showing how system programming can create engaging user experiences even with limited hardware.
+
+The success of this component reinforces the importance of building solid foundations—without our previous work on interrupts and the PIT, accurate music playback would have been impossible. This interconnectedness is a key characteristic of OS development, where each component builds upon and relies on others to create a cohesive system.
+
+\section{Improvisation}
+
+For the improvisation assignment, I decided to implement a simple terminal-based Matrix rain animation. Unfortunately i wasn't able to get it working in time. As such ill omit it completely from the report.
+
+
+\section{Pull Request}
+Forked repo: \href{https://github.com/valiantlynx/2025-ikt218-osdev/tree/master}{https://github.com/valiantlynx/2025-ikt218-osdev/tree/master} 
+
+Pull request: \href{}{https://github.com/uiaict/2025-ikt218-osdev/pull/99}
+
+
+%% BIBLIOGRAFI %%
+\begin{thebibliography}{9}
+\bibitem{tanenbaum} 
+Andrew S. Tanenbaum, \textit{Modern Operating Systems}. Prentice Hall, Fourth Edition, 2014.
+
+\bibitem{silberschatz} 
+Abraham Silberschatz, Peter B. Galvin, Greg Gagne, \textit{Operating System Concepts}. Wiley, Tenth Edition, 2018.
+
+\bibitem{uefi} 
+Unified EFI Forum, \textit{UEFI Specification}. Version 2.8, 2019.
+
+\end{thebibliography}
+\newpage
+
+%% VEDLEGG %%
+
+%% DOKUMENT SLUTT %%
+\end{document}
